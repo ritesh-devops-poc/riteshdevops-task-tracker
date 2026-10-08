@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ritesh DevOps Task Tracker</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>Ritesh DevOps Task Tracker</h1>
+
+        <p class="subtitle">
+            Manage your DevOps tasks
+        </p>
+
+        <form action="/tasks" method="POST" class="task-form">
+
+            <input
+                type="text"
+                name="title"
+                placeholder="Task title"
+                required
+            >
+
+            <textarea
+                name="description"
+                placeholder="Task description"
+            ></textarea>
+
+            <button type="submit">
+                Add Task
+            </button>
+
+        </form>
+
+        <div class="tasks">
+
+            <% tasks.forEach(task => { %>
+
+                <div class="task">
+
+                    <div>
+                        <h3><%= task.title %></h3>
+
+                        <p>
+                            <%= task.description || "No description" %>
+                        </p>
+
+                        <span class="<%= task.status %>">
+                            <%= task.status %>
+                        </span>
+                    </div>
+
+                    <div class="actions">
+
+                        <% if (task.status !== "completed") { %>
+
+                            <form
+                                action="/tasks/<%= task.id %>/complete"
+                                method="POST"
+                            >
+                                <button type="submit">
+                                    Complete
+                                </button>
+                            </form>
+
+                        <% } %>
+
+                        <form
+                            action="/tasks/<%= task.id %>/delete"
+                            method="POST"
+                        >
+                            <button type="submit">
+                                Delete
+                            </button>
+                        </form>
+
+                    </div>
+
+                </div>
+
+            <% }) %>
+
+        </div>
+
+    </div>
+
+</body>
+</html>
