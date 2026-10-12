@@ -1,0 +1,120 @@
+
+name: Deploy Task Tracker to Dev
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # Deploy only when a PR is actually merged into develop.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy through SSM
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$COMMIT_SHA" || "$COMMIT_SHA" == "null" ]]; then
+            echo "Error: PR merge commit SHA is missing."
+            exit 1
+          fi
+
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Environment,Values=dev" \
+              "Name=tag:Application,Values=task-tracker" \
+              "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          COUNT=$(wc -w <<< "$INSTANCE_IDS")
+
+          if [[ "$COUNT" -ne 1 ]]; then
+            echo "Expected exactly one running Dev EC2 instance; found $COUNT."
+            exit 1
+          fi
+
+          INSTANCE_ID="$INSTANCE_IDS"
+
+          echo "Deploying commit: $COMMIT_SHA"
+          echo "Target instance: $INSTANCE_ID"
+
+          COMMANDS=$(jq -n --arg sha "$COMMIT_SHA" '{
+            commands: [
+              "set -e",
+              "export DEBIAN_FRONTEND=noninteractive",
+              "if ! command -v node >/dev/null 2>&1 || ! node -v | grep -q \"^v22\\.\"; then apt-get update && apt-get install -y curl ca-certificates gnupg && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs; fi",
+              "apt-get update && apt-get install -y git",
+              "if [ ! -d /opt/task-tracker/.git ]; then if [ -e /opt/task-tracker ]; then echo \"Deployment directory exists but is not a Git repository\"; exit 1; fi; git clone https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git /opt/task-tracker; fi",
+              "git -C /opt/task-tracker fetch origin develop",
+              "git -C /opt/task-tracker checkout --force \"$sha\"",
+              "chown -R ubuntu:ubuntu /opt/task-tracker",
+              "test -f /etc/task-tracker.env || { echo \"Missing /etc/task-tracker.env database configuration\"; exit 1; }",
+              "cd /opt/task-tracker && runuser -u ubuntu -- npm ci --omit=dev",
+              "printf \"[Unit]\\nDescription=Task Tracker\\nAfter=network.target\\n[Service]\\nType=simple\\nUser=ubuntu\\nWorkingDirectory=/opt/task-tracker\\nEnvironmentFile=/etc/task-tracker.env\\nExecStart=/usr/bin/node /opt/task-tracker/app.js\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n\" > /etc/systemd/system/task-tracker.service",
+              "systemctl daemon-reload && systemctl enable task-tracker && systemctl restart task-tracker",
+              "sleep 3",
+              "systemctl is-active --quiet task-tracker || { systemctl status task-tracker --no-pager; journalctl -u task-tracker -n 50 --no-pager; exit 1; }",
+              "echo \"Task Tracker service is active.\""
+            ]
+          }')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Task Tracker $COMMIT_SHA" \
+            --parameters "$COMMANDS" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+
+            if [[ "$STATUS" == "Success" ]]; then
+              echo "Deployment successful."
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'StandardOutputContent' \
+                --output text
+              exit 0
+            fi
+
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Deployment failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --output json
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Deployment did not finish within 10 minutes."
+          echo "Check SSM Run Command ID: $COMMAND_ID"
+          exit 1
