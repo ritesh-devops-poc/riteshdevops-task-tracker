@@ -64,7 +64,7 @@ jobs:
               "apt-get update && apt-get install -y git",
               "if [ ! -d /opt/task-tracker/.git ]; then if [ -e /opt/task-tracker ]; then echo \"Deployment directory exists but is not a Git repository\"; exit 1; fi; git clone https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git /opt/task-tracker; fi",
               "git -C /opt/task-tracker fetch origin develop",
-              "git -C /opt/task-tracker checkout --force \"$sha\"",
+              ("git -C /opt/task-tracker checkout --force " + $sha),
               "chown -R ubuntu:ubuntu /opt/task-tracker",
               "test -f /etc/task-tracker.env || { echo \"Missing /etc/task-tracker.env database configuration\"; exit 1; }",
               "cd /opt/task-tracker && runuser -u ubuntu -- npm ci --omit=dev",
