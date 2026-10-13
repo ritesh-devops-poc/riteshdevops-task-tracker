@@ -1,11 +1,13 @@
 
-name: Deploy Task Tracker to Dev
+name: Deploy Task Tracker
 
 on:
   pull_request:
     types: [closed]
     branches:
       - develop
+      - stage
+      - master
 
 permissions:
   contents: read
@@ -26,6 +28,7 @@ jobs:
       - name: Deploy through SSM
         env:
           COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
         shell: bash
         run: |
           set -euo pipefail
@@ -35,9 +38,29 @@ jobs:
             exit 1
           fi
 
+          case "$TARGET_BRANCH" in
+            develop)
+              ENVIRONMENT="dev"
+              ;;
+            stage)
+              ENVIRONMENT="stage"
+              ;;
+            master)
+              ENVIRONMENT="prod"
+              ;;
+            *)
+              echo "Unsupported target branch: $TARGET_BRANCH"
+              exit 1
+              ;;
+          esac
+
+          echo "Target branch: $TARGET_BRANCH"
+          echo "Target environment: $ENVIRONMENT"
+          echo "Deploying commit: $COMMIT_SHA"
+
           INSTANCE_IDS=$(aws ec2 describe-instances \
             --filters \
-              "Name=tag:Environment,Values=dev" \
+              "Name=tag:Environment,Values=$ENVIRONMENT" \
               "Name=tag:Application,Values=task-tracker" \
               "Name=instance-state-name,Values=running" \
             --query 'Reservations[].Instances[].InstanceId' \
@@ -46,13 +69,12 @@ jobs:
           COUNT=$(wc -w <<< "$INSTANCE_IDS")
 
           if [[ "$COUNT" -ne 1 ]]; then
-            echo "Expected exactly one running Dev EC2 instance; found $COUNT."
+            echo "Expected exactly one running instance for Environment=$ENVIRONMENT and Application=task-tracker; found $COUNT."
             exit 1
           fi
 
           INSTANCE_ID="$INSTANCE_IDS"
-          echo "Deploying commit: $COMMIT_SHA"
-          echo "Target instance: $INSTANCE_ID"
+          echo "Target EC2 instance: $INSTANCE_ID"
 
           DEPLOY_SCRIPT=$(cat <<'REMOTE_SCRIPT'
           set -eu
@@ -86,9 +108,11 @@ jobs:
           fi
 
           git -c safe.directory=/opt/task-tracker \
-              -C /opt/task-tracker fetch origin develop
+              -C /opt/task-tracker fetch origin "$DEPLOY_BRANCH"
+
           git -c safe.directory=/opt/task-tracker \
               -C /opt/task-tracker checkout --force "$COMMIT_SHA"
+
           chown -R ubuntu:ubuntu /opt/task-tracker
 
           echo "Preparing database credentials..."
@@ -166,18 +190,20 @@ jobs:
             exit 1
           fi
 
-          echo "PostgreSQL setup and application deployment completed."
+          echo "Deployment completed for environment: $DEPLOY_BRANCH"
           echo "Task Tracker service is active."
           REMOTE_SCRIPT
           )
 
-          DEPLOY_SCRIPT=$(printf 'COMMIT_SHA=%s\n%s' "$COMMIT_SHA" "$DEPLOY_SCRIPT")
+          DEPLOY_SCRIPT=$(printf 'COMMIT_SHA=%s\nDEPLOY_BRANCH=%s\n%s' \
+            "$COMMIT_SHA" "$TARGET_BRANCH" "$DEPLOY_SCRIPT")
+
           COMMANDS=$(jq -n --arg script "$DEPLOY_SCRIPT" '{commands: [$script]}')
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy Task Tracker $COMMIT_SHA" \
+            --comment "Deploy Task Tracker $TARGET_BRANCH at $COMMIT_SHA" \
             --parameters "$COMMANDS" \
             --query 'Command.CommandId' \
             --output text)
