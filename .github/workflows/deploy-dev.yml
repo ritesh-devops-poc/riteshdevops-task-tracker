@@ -85,8 +85,10 @@ jobs:
             git clone https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git /opt/task-tracker
           fi
 
-          git -C /opt/task-tracker fetch origin develop
-          git -C /opt/task-tracker checkout --force "$COMMIT_SHA"
+          git -c safe.directory=/opt/task-tracker \
+              -C /opt/task-tracker fetch origin develop
+          git -c safe.directory=/opt/task-tracker \
+              -C /opt/task-tracker checkout --force "$COMMIT_SHA"A"
           chown -R ubuntu:ubuntu /opt/task-tracker
 
           echo "Preparing database credentials..."
