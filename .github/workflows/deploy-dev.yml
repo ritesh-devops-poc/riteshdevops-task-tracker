@@ -12,168 +12,65 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: task-tracker-deploy-${{ github.event.pull_request.base.ref }}
-  cancel-in-progress: false
-
 jobs:
   deploy:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
-      - name: Prepare SSH
+      - name: Deploy via SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
           DEV_HOST: ${{ secrets.DEV_HOST }}
           STAGE_HOST: ${{ secrets.STAGE_HOST }}
           PROD_HOST: ${{ secrets.PROD_HOST }}
-          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
-          DEPLOY_BRANCH: ${{ github.event.pull_request.base.ref }}
+          BRANCH: ${{ github.event.pull_request.base.ref }}
           COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          case "$DEPLOY_BRANCH" in
+          case "$BRANCH" in
             develop) HOST="$DEV_HOST" ;;
             stage)   HOST="$STAGE_HOST" ;;
             master)  HOST="$PROD_HOST" ;;
-            *) echo "Unsupported deployment branch"; exit 1 ;;
+            *) exit 1 ;;
           esac
 
-          test -n "$HOST"
-          test -n "$SSH_USERNAME"
-          test -n "$SSH_PRIVATE_KEY"
-          [[ "$COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo "Invalid or missing merge commit SHA"
-            exit 1
-          }
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/task-tracker-key
-          chmod 600 ~/.ssh/task-tracker-key
-
-          # POC: learn the host key at connection time.
-          # For stronger host verification, pin verified host keys in a secret.
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          chmod 600 ~/.ssh/known_hosts
 
-          echo "Deploying $COMMIT_SHA to $DEPLOY_BRANCH"
-
-          ssh \
-            -i ~/.ssh/task-tracker-key \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            "$SSH_USERNAME@$HOST" \
-            "COMMIT_SHA='$COMMIT_SHA' DEPLOY_BRANCH='$DEPLOY_BRANCH' bash -s" <<'REMOTE_SCRIPT'
-          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key "$SSH_USERNAME@$HOST" \
+            "COMMIT_SHA='$COMMIT_SHA' BRANCH='$BRANCH' bash -s" <<'REMOTE'
+          set -e
 
           APP_DIR=/opt/task-tracker
           REPO=https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git
 
-          echo "Installing required system packages..."
-          sudo apt-get update
-          sudo apt-get install -y curl ca-certificates git openssl postgresql postgresql-client
-
-          if ! node -v 2>/dev/null | grep -q '^v22\.'; then
+          if ! command -v node >/dev/null || ! node -v | grep -q '^v22\.'; then
+            sudo apt-get update
+            sudo apt-get install -y curl ca-certificates git
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
             sudo apt-get install -y nodejs
           fi
 
-          sudo systemctl enable --now postgresql
-
-          echo "Preparing application directory..."
-          sudo mkdir -p "$APP_DIR"
-          sudo chown ubuntu:ubuntu "$APP_DIR"
-
           if [ ! -d "$APP_DIR/.git" ]; then
-            if [ -n "$(find "$APP_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-              echo "Application directory is not empty and is not a Git repository."
-              exit 1
-            fi
+            sudo mkdir -p "$APP_DIR"
+            sudo chown ubuntu:ubuntu "$APP_DIR"
             git clone "$REPO" "$APP_DIR"
           fi
 
-          git -C "$APP_DIR" fetch origin "$DEPLOY_BRANCH"
+          git -C "$APP_DIR" fetch origin "$BRANCH"
           git -C "$APP_DIR" checkout --force "$COMMIT_SHA"
-
-          echo "Preparing database credentials..."
-          DB_PASSWORD=""
-          if sudo test -f /etc/task-tracker.env; then
-            DB_PASSWORD="$(sudo sed -n 's/^DB_PASSWORD=//p' /etc/task-tracker.env | head -n 1 || true)"
-          fi
-
-          if [[ ! "$DB_PASSWORD" =~ ^[a-fA-F0-9]{64}$ ]]; then
-            DB_PASSWORD="$(openssl rand -hex 32)"
-          fi
-
-          printf 'DB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=task_tracker\nDB_USER=task_tracker_app\nDB_PASSWORD=%s\nPORT=3000\n' "$DB_PASSWORD" \
-            | sudo tee /etc/task-tracker.env >/dev/null
-          sudo chown root:root /etc/task-tracker.env
-          sudo chmod 600 /etc/task-tracker.env
-
-          if ! sudo -u postgres psql -tAc \
-            "SELECT 1 FROM pg_roles WHERE rolname='task_tracker_app'" | grep -q '^1$'; then
-            sudo -u postgres psql -v ON_ERROR_STOP=1 \
-              -c "CREATE ROLE task_tracker_app LOGIN"
-          fi
-
-          sudo -u postgres psql -v ON_ERROR_STOP=1 \
-            -c "ALTER ROLE task_tracker_app WITH LOGIN PASSWORD '$DB_PASSWORD'"
-
-          if ! sudo -u postgres psql -tAc \
-            "SELECT 1 FROM pg_database WHERE datname='task_tracker'" | grep -q '^1$'; then
-            sudo -u postgres createdb task_tracker
-          fi
-
-          echo "Applying database schema..."
-          test -f "$APP_DIR/db/init.sql"
-          sudo -u postgres psql -v ON_ERROR_STOP=1 \
-            -d task_tracker -f "$APP_DIR/db/init.sql"
-
-          sudo -u postgres psql -v ON_ERROR_STOP=1 -d task_tracker <<'SQL'
-          GRANT CONNECT ON DATABASE task_tracker TO task_tracker_app;
-          GRANT USAGE ON SCHEMA public TO task_tracker_app;
-          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO task_tracker_app;
-          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO task_tracker_app;
-          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO task_tracker_app;
-          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO task_tracker_app;
-          SQL
-
-          echo "Installing production dependencies..."
           cd "$APP_DIR"
           npm ci --omit=dev
 
-          echo "Configuring systemd..."
-          sudo tee /etc/systemd/system/task-tracker.service >/dev/null <<'SERVICE'
-          [Unit]
-          Description=Task Tracker Node.js Application
-          After=network.target postgresql.service
-          Wants=postgresql.service
-
-          [Service]
-          Type=simple
-          User=ubuntu
-          WorkingDirectory=/opt/task-tracker
-          EnvironmentFile=/etc/task-tracker.env
-          ExecStart=/usr/bin/node /opt/task-tracker/app.js
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo systemctl daemon-reload
-          sudo systemctl enable task-tracker
           sudo systemctl restart task-tracker
-          sleep 3
-
-          if ! sudo systemctl is-active --quiet task-tracker; then
-            sudo journalctl -u task-tracker -n 50 --no-pager || true
-            exit 1
-          fi
+          sudo systemctl is-active --quiet task-tracker
 
           echo "Deployment successful: $COMMIT_SHA"
-          REMOTE_SCRIPT
+          REMOTE
