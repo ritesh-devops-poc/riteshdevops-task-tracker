@@ -4,172 +4,147 @@ name: Deploy Task Tracker
 on:
   pull_request:
     types: [closed]
-    branches:
-      - develop
-      - stage
-      - master
+    branches: [develop, stage, master]
 
 permissions:
   contents: read
 
 jobs:
-  # Stage 1: Validate
-  validate:
-    name: Validate
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Validate application
-        run: |
-          npm ci
-          node --check app.js
-          test -f db/init.sql
-
-  # Stage 2: Deploy
   deploy:
-    name: Deploy to EC2
-    needs: validate
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Deploy through SSM
+      - name: Deploy application and PostgreSQL
         env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          DEV_HOST: ${{ secrets.DEV_HOST }}
+          STAGE_HOST: ${{ secrets.STAGE_HOST }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          BRANCH: ${{ github.event.pull_request.base.ref }}
           COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
         shell: bash
         run: |
           set -euo pipefail
 
-          case "$TARGET_BRANCH" in
-            develop) ENVIRONMENT="dev" ;;
-            stage)   ENVIRONMENT="stage" ;;
-            master)  ENVIRONMENT="prod" ;;
-            *) echo "Unsupported branch: $TARGET_BRANCH"; exit 1 ;;
+          case "$BRANCH" in
+            develop) HOST="$DEV_HOST" ;;
+            stage)   HOST="$STAGE_HOST" ;;
+            master)  HOST="$PROD_HOST" ;;
+            *) exit 1 ;;
           esac
 
-          if [[ -z "$COMMIT_SHA" || "$COMMIT_SHA" == "null" ]]; then
-            echo "Missing merge commit SHA."
-            exit 1
+          [[ "$COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          test -n "$HOST"
+          test -n "$SSH_USERNAME"
+          test -n "$SSH_PRIVATE_KEY"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # POC only: verify and pin host keys before production use.
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            "$SSH_USERNAME@$HOST" \
+            "COMMIT_SHA='$COMMIT_SHA' BRANCH='$BRANCH' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          APP=/opt/task-tracker
+          REPO=https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git
+
+          # Install PostgreSQL, Git and Node.js when required.
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates git openssl \
+            postgresql postgresql-client
+
+          if ! node -v 2>/dev/null | grep -q '^v22\.'; then
+            curl -fsSL https://deb.nodesource.com/setup_22.x \
+              | sudo -E bash -
+            sudo apt-get install -y nodejs
           fi
 
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:Environment,Values=$ENVIRONMENT" \
-              "Name=tag:Application,Values=task-tracker" \
-              "Name=instance-state-name,Values=running" \
-            --query 'Reservations[].Instances[].InstanceId' \
-            --output text)
+          sudo systemctl enable --now postgresql
 
-          read -r -a IDS <<< "$INSTANCE_IDS"
-
-          if [[ "${#IDS[@]}" -ne 1 || "${IDS[0]}" == "None" ]]; then
-            echo "Expected exactly one running EC2 instance; found ${#IDS[@]}."
-            exit 1
-          fi
-
-          INSTANCE_ID="${IDS[0]}"
-          echo "Deploying $COMMIT_SHA to $ENVIRONMENT ($INSTANCE_ID)"
-
-          DEPLOY_SCRIPT=$(cat <<'REMOTE_SCRIPT'
-          set -eu
-          export DEBIAN_FRONTEND=noninteractive
-
-          apt-get update
-          apt-get install -y curl ca-certificates gnupg git openssl postgresql postgresql-client
-
-          NODE_VERSION="$(node -v 2>/dev/null || true)"
-          case "$NODE_VERSION" in
-            v22.*) ;;
-            *)
-              curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-              apt-get install -y nodejs
-              ;;
-          esac
-
-          systemctl enable --now postgresql
-
-          if [ ! -d /opt/task-tracker/.git ]; then
-            if [ -e /opt/task-tracker ]; then
-              echo "Deployment directory exists but is not a Git repository."
-              exit 1
-            fi
-            git clone https://github.com/ritesh-devops-poc/riteshdevops-task-tracker.git /opt/task-tracker
-          fi
-
-          git -c safe.directory=/opt/task-tracker \
-              -C /opt/task-tracker fetch origin "$DEPLOY_BRANCH"
-
-          git -c safe.directory=/opt/task-tracker \
-              -C /opt/task-tracker checkout --force "$COMMIT_SHA"
-
-          chown -R ubuntu:ubuntu /opt/task-tracker
-
+          # Configure database credentials.
           DB_PASSWORD=""
-          if [ -f /etc/task-tracker.env ]; then
-            DB_PASSWORD="$(sed -n 's/^DB_PASSWORD=//p' /etc/task-tracker.env | head -n 1 || true)"
+          if sudo test -f /etc/task-tracker.env; then
+            DB_PASSWORD="$(sudo sed -n \
+              's/^DB_PASSWORD=//p' /etc/task-tracker.env | head -n 1)"
           fi
 
-          if ! printf '%s' "$DB_PASSWORD" | grep -Eq '^[a-fA-F0-9]{64}$'; then
+          if [[ ! "$DB_PASSWORD" =~ ^[a-fA-F0-9]{64}$ ]]; then
             DB_PASSWORD="$(openssl rand -hex 32)"
           fi
 
-          umask 077
-          printf 'DB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=task_tracker\nDB_USER=task_tracker_app\nDB_PASSWORD=%s\nPORT=3000\n' "$DB_PASSWORD" > /etc/task-tracker.env
-          chown root:root /etc/task-tracker.env
-          chmod 600 /etc/task-tracker.env
-
-          if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='task_tracker_app'" | grep -q '^1$'; then
-            runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "CREATE ROLE task_tracker_app LOGIN"
+          # Create the application database role if needed.
+          if ! sudo -u postgres psql -tAc \
+            "SELECT 1 FROM pg_roles WHERE rolname='task_tracker_app'" \
+            | grep -q 1; then
+            sudo -u postgres psql -v ON_ERROR_STOP=1 \
+              -c "CREATE ROLE task_tracker_app LOGIN"
           fi
 
-          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE task_tracker_app WITH LOGIN PASSWORD '$DB_PASSWORD'"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE task_tracker_app WITH LOGIN PASSWORD '$DB_PASSWORD'"
 
-          if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='task_tracker'" | grep -q '^1$'; then
-            runuser -u postgres -- createdb task_tracker
+          # Create the database if needed; preserve existing data.
+          if ! sudo -u postgres psql -tAc \
+            "SELECT 1 FROM pg_database WHERE datname='task_tracker'" \
+            | grep -q 1; then
+            sudo -u postgres createdb -O task_tracker_app task_tracker
           fi
 
-          test -f /opt/task-tracker/db/init.sql
-          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -d task_tracker -f /opt/task-tracker/db/init.sql
+          printf 'PORT=3000\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=task_tracker\nDB_USER=task_tracker_app\nDB_PASSWORD=%s\n' \
+            "$DB_PASSWORD" | sudo tee /etc/task-tracker.env >/dev/null
 
-          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -d task_tracker <<'SQL'
+          sudo chown root:root /etc/task-tracker.env
+          sudo chmod 600 /etc/task-tracker.env
+
+          # Fetch the application commit.
+          if [ ! -d "$APP/.git" ]; then
+            if [ -n "$(sudo find "$APP" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "Application directory is not empty."
+              exit 1
+            fi
+            sudo chown ubuntu:ubuntu "$APP"
+            git clone "$REPO" "$APP"
+          fi
+
+          git -C "$APP" fetch origin "$BRANCH"
+          git -C "$APP" checkout --force "$COMMIT_SHA"
+
+          # Initialize/update the schema and grant application access.
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -d task_tracker -f "$APP/db/init.sql"
+
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -d task_tracker <<'SQL'
           GRANT CONNECT ON DATABASE task_tracker TO task_tracker_app;
           GRANT USAGE ON SCHEMA public TO task_tracker_app;
           GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO task_tracker_app;
           GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO task_tracker_app;
-          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO task_tracker_app;
-          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO task_tracker_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO task_tracker_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO task_tracker_app;
           SQL
 
-          cd /opt/task-tracker
-          runuser -u ubuntu -- npm ci --omit=dev
+          # Install application dependencies.
+          cd "$APP"
+          npm ci --omit=dev
 
-          cat > /etc/systemd/system/task-tracker.service <<'SERVICE'
+          # Create the application service if it doesn't exist.
+          if ! sudo test -f /etc/systemd/system/task-tracker.service; then
+            sudo tee /etc/systemd/system/task-tracker.service >/dev/null <<'SERVICE'
           [Unit]
-          Description=Task Tracker Node.js Application
+          Description=Task Tracker
           After=network.target postgresql.service
-          Wants=postgresql.service
 
           [Service]
-          Type=simple
           User=ubuntu
           WorkingDirectory=/opt/task-tracker
           EnvironmentFile=/etc/task-tracker.env
@@ -180,63 +155,13 @@ jobs:
           [Install]
           WantedBy=multi-user.target
           SERVICE
-
-          systemctl daemon-reload
-          systemctl enable task-tracker
-          systemctl restart task-tracker
-          sleep 3
-
-          if ! systemctl is-active --quiet task-tracker; then
-            systemctl status task-tracker --no-pager || true
-            journalctl -u task-tracker -n 50 --no-pager || true
-            exit 1
           fi
 
-          echo "Deployment successful for $DEPLOY_BRANCH."
-          REMOTE_SCRIPT
-          )
+          sudo systemctl daemon-reload
+          sudo systemctl enable task-tracker
+          sudo systemctl restart task-tracker
+          sleep 3
+          sudo systemctl is-active --quiet task-tracker
 
-          DEPLOY_SCRIPT=$(printf 'COMMIT_SHA=%s\nDEPLOY_BRANCH=%s\n%s' \
-            "$COMMIT_SHA" "$TARGET_BRANCH" "$DEPLOY_SCRIPT")
-
-          COMMANDS=$(jq -n --arg script "$DEPLOY_SCRIPT" '{commands: [$script]}')
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy Task Tracker $TARGET_BRANCH at $COMMIT_SHA" \
-            --parameters "$COMMANDS" \
-            --query 'Command.CommandId' \
-            --output text)
-
-          echo "SSM Command ID: $COMMAND_ID"
-
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || true)
-
-            if [[ "$STATUS" == "Success" ]]; then
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query 'StandardOutputContent' \
-                --output text
-              exit 0
-            fi
-
-            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --output json
-              exit 1
-            fi
-
-            sleep 10
-          done
-
-          echo "Deployment timed out. SSM Command ID: $COMMAND_ID"
-          exit 1
+          echo "Deployment successful: $COMMIT_SHA"
+          REMOTE
