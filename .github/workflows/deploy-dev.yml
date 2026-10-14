@@ -107,11 +107,15 @@ jobs:
 
           # Fetch the application commit.
           if [ ! -d "$APP/.git" ]; then
-            if [ -n "$(sudo find "$APP" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            if [ -e "$APP" ] && [ -n "$(sudo find "$APP" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
               echo "Application directory is not empty."
               exit 1
             fi
+
+            sudo mkdir -p "$(dirname "$APP")"
+            sudo mkdir -p "$APP"
             sudo chown ubuntu:ubuntu "$APP"
+
             git clone "$REPO" "$APP"
           fi
 
