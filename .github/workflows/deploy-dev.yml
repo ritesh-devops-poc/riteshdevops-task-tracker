@@ -42,7 +42,7 @@ jobs:
   deploy:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-
+    needs: unit-tests
     steps:
       - name: Deploy application and PostgreSQL
         env:
