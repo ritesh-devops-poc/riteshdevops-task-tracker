@@ -1,4 +1,4 @@
-
+```yaml
 name: Deploy Task Tracker
 
 on:
@@ -15,10 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
       - run: npm ci
       - run: npm run lint
 
@@ -28,20 +30,23 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
       - run: npm ci
       - run: npm test
 
   deploy:
-    name: Deploy
+    name: Deploy Application
     if: github.event.pull_request.merged == true
     needs: [lint, unit-tests]
     runs-on: ubuntu-latest
+
     steps:
-      - name: Deploy application and database
+      - name: Deploy application
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
@@ -50,6 +55,7 @@ jobs:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           BRANCH: ${{ github.event.pull_request.base.ref }}
           COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+
         run: |
           set -e
 
@@ -57,7 +63,7 @@ jobs:
             develop) HOST="$DEV_HOST" ;;
             stage) HOST="$STAGE_HOST" ;;
             master) HOST="$PROD_HOST" ;;
-            *) exit 1 ;;
+            *) echo "Unsupported branch: $BRANCH"; exit 1 ;;
           esac
 
           mkdir -p ~/.ssh
@@ -65,7 +71,8 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-          ssh -i ~/.ssh/deploy_key "$SSH_USERNAME@$HOST" \
+          ssh -i ~/.ssh/deploy_key \
+            "$SSH_USERNAME@$HOST" \
             "COMMIT_SHA='$COMMIT_SHA' BRANCH='$BRANCH' bash -s" <<'REMOTE'
           set -e
 
@@ -89,18 +96,16 @@ jobs:
           git -C "$APP" fetch origin "$BRANCH"
           git -C "$APP" checkout --force "$COMMIT_SHA"
 
-          # All database provisioning lives in this script.
-          sudo bash "$APP/scripts/setup-database.sh" "$APP/db/init.sql"
-
-          # Deploy the application.
+          # Install production application dependencies.
           cd "$APP"
           npm ci --omit=dev
 
+          # Create the service only if it does not already exist.
           if ! sudo test -f /etc/systemd/system/task-tracker.service; then
             sudo tee /etc/systemd/system/task-tracker.service >/dev/null <<'SERVICE'
           [Unit]
           Description=Task Tracker
-          After=network.target postgresql.service
+          After=network.target
 
           [Service]
           User=ubuntu
@@ -118,8 +123,10 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable task-tracker
           sudo systemctl restart task-tracker
+
           sleep 3
           sudo systemctl is-active --quiet task-tracker
 
-          echo "Deployment successful: $COMMIT_SHA"
+          echo "Application deployment successful: $COMMIT_SHA"
           REMOTE
+```
