@@ -11,8 +11,19 @@ const db = new Pool({
   host: process.env.DB_HOST,
   database: process.env.DB_DATABASE,
   password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  port: process.env.DB_PORT || 5432,
+  ssl:
+    process.env.DB_SSL === "true"
+      ? {
+          ca: require("node:fs").readFileSync(
+            process.env.DB_SSL_CA,
+            "utf8"
+          ),
+          rejectUnauthorized: true,
+        }
+      : false,
 });
+
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
